@@ -124,6 +124,7 @@ require (
 	github.com/influxdata/toml v0.0.0-20190415235208-270119a8ce65
 	github.com/intel/iaevents v1.1.0
 	github.com/intel/powertelemetry v1.0.2
+	github.com/itchyny/gojq v0.12.17
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgio v1.0.0
 	github.com/jackc/pgtype v1.14.4
@@ -389,6 +390,7 @@ require (
 	github.com/hashicorp/serf v0.10.1 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/imdario/mergo v0.3.16 // indirect
+	github.com/itchyny/timefmt-go v0.1.6 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgproto3/v2 v2.3.3 // indirect

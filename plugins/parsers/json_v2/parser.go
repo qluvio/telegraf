@@ -1,15 +1,19 @@
 package json_v2
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/dimchansky/utfbom"
+	"github.com/itchyny/gojq"
 	"github.com/tidwall/gjson"
 
 	"github.com/influxdata/telegraf"
@@ -63,19 +67,23 @@ type DataSet struct {
 }
 
 type Object struct {
-	Path               string            `toml:"path"`     // REQUIRED
-	Optional           bool              `toml:"optional"` // Will suppress errors if there isn't a match with Path
-	TimestampKey       string            `toml:"timestamp_key"`
-	TimestampFormat    string            `toml:"timestamp_format"`   // OPTIONAL, but REQUIRED when timestamp_path is defined
-	TimestampTimezone  string            `toml:"timestamp_timezone"` // OPTIONAL, but REQUIRES timestamp_path
-	Renames            map[string]string `toml:"renames"`
-	Fields             map[string]string `toml:"fields"`
-	Tags               []string          `toml:"tags"`
-	IncludedKeys       []string          `toml:"included_keys"`
-	ExcludedKeys       []string          `toml:"excluded_keys"`
-	DisablePrependKeys bool              `toml:"disable_prepend_keys"`
-	FieldPaths         []DataSet         `toml:"field"`
-	TagPaths           []DataSet         `toml:"tag"`
+	Path                string            `toml:"path"`     // REQUIRED
+	Optional            bool              `toml:"optional"` // Will suppress errors if there isn't a match with Path
+	TimestampKey        string            `toml:"timestamp_key"`
+	TimestampFormat     string            `toml:"timestamp_format"`   // OPTIONAL, but REQUIRED when timestamp_path is defined
+	TimestampTimezone   string            `toml:"timestamp_timezone"` // OPTIONAL, but REQUIRES timestamp_path
+	Renames             map[string]string `toml:"renames"`
+	Fields              map[string]string `toml:"fields"`
+	Tags                []string          `toml:"tags"`
+	IncludeMatchingKeys []string          `toml:"include_matching_keys"` // only include keys selected  by this regex
+	ExcludeMatchingKeys []string          `toml:"exclude_matching_keys"` // exclude keys matching this regex
+	JQ                  []string          `toml:"jq"`                    // jq expression to apply to the result of 'path'
+	JqNoMerge           bool              `toml:"jq_no_merge"`           // by default (when false), multiple values are merged - if possible - into one
+	IncludedKeys        []string          `toml:"included_keys"`
+	ExcludedKeys        []string          `toml:"excluded_keys"`
+	DisablePrependKeys  bool              `toml:"disable_prepend_keys"`
+	FieldPaths          []DataSet         `toml:"field"`
+	TagPaths            []DataSet         `toml:"tag"`
 }
 
 type pathResult struct {
@@ -469,6 +477,128 @@ func (p *Parser) existsInpathResults(index int) *pathResult {
 	return nil
 }
 
+// jqTransform transforms the gjson.Result using the jqExpr and jqNoMerge (from config parameters)
+// The result of JQ transform are merged into a single map if
+// * JqNoMerge is false and
+// * all elements are of king map with string keys
+// otherwise no merge is performed.
+func jqTransform(
+	jqExpr []string,
+	jqNoMerge bool,
+	optional bool,
+	result gjson.Result) (gjson.Result, error) {
+
+	for _, jq := range jqExpr {
+		if jq == "" {
+			continue
+		}
+		query, err := gojq.Parse(jq)
+		if err != nil {
+			return gjson.Result{}, err
+		}
+		var v any
+		err = json.Unmarshal([]byte(result.Raw), &v)
+		if err != nil {
+			return gjson.Result{}, err
+		}
+
+		jqValues := []any(nil)
+		iter := query.Run(v)
+		for {
+			v, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if err, ok := v.(error); ok {
+				if err, ok := err.(*gojq.HaltError); ok && err.Value() == nil {
+					break
+				}
+				return gjson.Result{}, err
+			}
+			jqValues = append(jqValues, v)
+		}
+
+		var values any = jqValues
+		if len(jqValues) > 1 && !jqNoMerge {
+			mmap := make(map[string]any)
+			merge := true
+
+		out:
+			for _, jv := range jqValues {
+				mv := reflect.ValueOf(jv)
+				if mv.Kind() != reflect.Map || reflect.TypeOf(jv).Key() != reflect.TypeOf("") {
+					merge = false
+					break out
+				}
+				kvs := mv.MapKeys()
+				for _, k := range kvs {
+					mmap[k.String()] = mv.MapIndex(k).Interface()
+				}
+			}
+			if merge {
+				jqValues = []any{mmap}
+			}
+		}
+		if len(jqValues) == 1 {
+			values = jqValues[0]
+		}
+		bytes, err := json.Marshal(values)
+		if err != nil {
+			return gjson.Result{}, err
+		}
+
+		if !gjson.ValidBytes(bytes) {
+			return gjson.Result{}, fmt.Errorf("applying jq (%s) resulted in invalid json %s", jq, string(bytes))
+		}
+		result = gjson.ParseBytes(bytes)
+		if !result.Exists() && !optional {
+			return gjson.Result{}, fmt.Errorf("no result after applying jq %s", jq)
+		}
+	}
+
+	return result, nil
+}
+
+// removeFields filters out fields matching the given matching keys from the given metrics.
+// Matching keys are first compiled into regex and passed to the remFn parameter.
+// A metric that remains with no field after filtering is removed from the return slice.
+func removeFields(
+	metrics []telegraf.Metric,
+	matchingKeys []string,
+	remFn func(reg *regexp.Regexp, key string) bool) ([]telegraf.Metric, error) {
+
+	if len(matchingKeys) == 0 {
+		return metrics, nil
+	}
+	var ret = []telegraf.Metric(nil)
+	for _, pattern := range matchingKeys {
+		reg, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range metrics {
+			// make a copy since RemoveField manipulates directly the slice
+			fields := m.FieldList()
+			d := make([]*telegraf.Field, len(fields))
+			copy(d, fields)
+			fields = d
+
+			for _, f := range fields {
+				if f == nil {
+					continue
+				}
+				if remFn(reg, f.Key) {
+					m.RemoveField(f.Key)
+				}
+			}
+			if len(m.FieldList()) > 0 {
+				ret = append(ret, m)
+			}
+		}
+	}
+	return ret, nil
+}
+
 // processObjects will iterate over all 'object' configs and create metrics for each
 func (p *Parser) processObjects(input []byte, objects []Object, timestamp time.Time) ([]telegraf.Metric, error) {
 	p.iterateObjects = true
@@ -485,6 +615,11 @@ func (p *Parser) processObjects(input []byte, objects []Object, timestamp time.T
 			if c.Optional {
 				continue
 			}
+			return nil, err
+		}
+
+		result, err := jqTransform(c.JQ, c.JqNoMerge, c.Optional, result)
+		if err != nil {
 			return nil, err
 		}
 
@@ -531,6 +666,24 @@ func (p *Parser) processObjects(input []byte, objects []Object, timestamp time.T
 		if err != nil {
 			return nil, err
 		}
+
+		metrics, err = removeFields(metrics,
+			p.objectConfig.IncludeMatchingKeys,
+			func(reg *regexp.Regexp, key string) bool {
+				return !reg.MatchString(key)
+			})
+		if err != nil {
+			return nil, err
+		}
+		metrics, err = removeFields(metrics,
+			p.objectConfig.ExcludeMatchingKeys,
+			func(reg *regexp.Regexp, key string) bool {
+				return reg.MatchString(key)
+			})
+		if err != nil {
+			return nil, err
+		}
+
 		t = append(t, metrics...)
 	}
 
