@@ -200,13 +200,15 @@ func (p *Parser) parseCriticalPath(input []byte) ([]telegraf.Metric, error) {
 			return nil, err
 		}
 
-		metrics = append(metrics, cartesianProduct(tags, fields)...)
+		cmetrics := cartesianProduct(tags, fields)
 
-		if len(objects) != 0 && len(metrics) != 0 {
-			metrics = cartesianProduct(objects, metrics)
+		if len(objects) != 0 && len(cmetrics) != 0 {
+			cmetrics = cartesianProduct(objects, cmetrics)
 		} else {
-			metrics = append(metrics, objects...)
+			cmetrics = append(cmetrics, objects...)
 		}
+
+		metrics = append(metrics, cmetrics...)
 	}
 
 	for k, v := range p.DefaultTags {
